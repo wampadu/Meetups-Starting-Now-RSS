@@ -1,148 +1,177 @@
 import os
 import re
 import html
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from dateutil import parser as dateparser
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from dateutil import parser as dateparser
+from playwright.sync_api import sync_playwright
 
 
 MEETUP_URL = "https://www.meetup.com/find/?dateRange=startingSoon&source=EVENTS&eventType=online"
-
-# RSS metadata
-FEED_TITLE = "Meetup (Online) — Starting Soon (Next Hour)"
-FEED_LINK = MEETUP_URL
-FEED_DESCRIPTION = "Auto-generated RSS for Meetup online events starting within the next hour."
 
 OUT_DIR = "public"
 OUT_FILE = os.path.join(OUT_DIR, "feed.xml")
 
 LOCAL_TZ = ZoneInfo("America/Toronto")
 WINDOW_MINUTES = 60
-MAX_ITEMS = 40
+MAX_ITEMS = 50
 
-
-@dataclass
-class EventItem:
-    title: str
-    link: str
-    when_text: str
-    start_dt: datetime | None
-    attendees: int | None
-
-
-def esc(s: str) -> str:
-    return html.escape((s or "").strip())
-
-
-def rfc2822(dt: datetime) -> str:
-    # Ensure timezone-aware
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+FEED_TITLE = "Meetup (Online) — Starting Soon (Next Hour)"
+FEED_LINK = MEETUP_URL
+FEED_DESCRIPTION = "Auto-generated RSS for Meetup online events starting within the next hour."
 
 
 def now_local() -> datetime:
     return datetime.now(tz=LOCAL_TZ)
 
 
-def parse_attendees(text: str) -> int | None:
+def rfc2822(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+
+
+def esc(s: str) -> str:
+    return html.escape((s or "").strip())
+
+
+def extract_attendees_from_text(text: str):
+    """
+    Best-effort attendee extraction from a card's text content.
+    Examples we may see:
+      - "12 attendees"
+      - "12 going"
+      - "12 RSVPs"
+      - "Attendees 12"
+    """
     if not text:
         return None
-    # Common patterns: "12 attendees", "12 going", "12 RSVPs", "12 people attending"
-    m = re.search(r"\b(\d{1,5})\s*(attendees|going|rsvps|people|attending)\b", text, re.I)
+    t = " ".join(text.split())
+    m = re.search(r"\b(\d{1,6})\s*(attendees|going|rsvps|people|attending)\b", t, re.I)
     if m:
         try:
             return int(m.group(1))
-        except Exception:
+        except:
+            return None
+    m2 = re.search(r"\battendees?\s*[:\-]?\s*(\d{1,6})\b", t, re.I)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except:
             return None
     return None
 
 
-def parse_start_datetime(text: str) -> datetime | None:
+def parse_start_dt(dt_attr: str, when_text: str):
     """
-    Best-effort parsing of Meetup time strings.
-    Handles:
-      - ISO datetime found in <time datetime="...">
-      - "Today 7:30 PM", "Tomorrow 9:00 AM"
-      - Some relative patterns like "in 30 minutes" (if present)
+    Try to produce a timezone-aware local datetime.
+
+    Priority:
+      1) <time datetime="..."> attribute (usually ISO)
+      2) text parsing (Today/Tomorrow/clock formats)
+      3) relative text "in 30 minutes" / "in 1 hour"
     """
-    if not text:
+    base = now_local()
+
+    # 1) datetime attribute
+    if dt_attr:
+        try:
+            dt = dateparser.parse(dt_attr)
+            if dt:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
+                else:
+                    dt = dt.astimezone(LOCAL_TZ)
+                return dt
+        except:
+            pass
+
+    t = (when_text or "").strip()
+    if not t:
         return None
+    t_clean = re.sub(r"\s+", " ", t)
 
-    t = re.sub(r"\s+", " ", text).strip()
-
-    # Relative: "in 30 minutes", "in 1 hour"
-    rel = re.search(r"\bin\s+(\d{1,3})\s*(minute|minutes|hour|hours)\b", t, re.I)
+    # 3) relative
+    rel = re.search(r"\bin\s+(\d{1,3})\s*(minute|minutes|hour|hours)\b", t_clean, re.I)
     if rel:
         n = int(rel.group(1))
         unit = rel.group(2).lower()
-        base = now_local()
         if "hour" in unit:
             return base + timedelta(hours=n)
         return base + timedelta(minutes=n)
 
-    # Replace "Today"/"Tomorrow" with actual dates for easier parsing
-    base = now_local()
-    if re.search(r"\btoday\b", t, re.I):
-        t2 = re.sub(r"\btoday\b", base.strftime("%Y-%m-%d"), t, flags=re.I)
-    elif re.search(r"\btomorrow\b", t, re.I):
-        t2 = re.sub(r"\btomorrow\b", (base + timedelta(days=1)).strftime("%Y-%m-%d"), t, flags=re.I)
-    else:
-        t2 = t
+    # 2) Today/Tomorrow substitution
+    if re.search(r"\btoday\b", t_clean, re.I):
+        t_clean = re.sub(r"\btoday\b", base.strftime("%Y-%m-%d"), t_clean, flags=re.I)
+    elif re.search(r"\btomorrow\b", t_clean, re.I):
+        t_clean = re.sub(r"\btomorrow\b", (base + timedelta(days=1)).strftime("%Y-%m-%d"), t_clean, flags=re.I)
 
+    # parse
     try:
-        dt = dateparser.parse(t2)
-        if dt is None:
+        dt = dateparser.parse(t_clean)
+        if not dt:
             return None
-        # Assume local tz if none
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=LOCAL_TZ)
         else:
             dt = dt.astimezone(LOCAL_TZ)
         return dt
-    except Exception:
+    except:
         return None
 
 
-def within_next_hour(dt: datetime | None) -> bool:
-    if dt is None:
-        return False
-    start = now_local()
-    end = start + timedelta(minutes=WINDOW_MINUTES)
-    return start <= dt <= end
+def is_within_next_hour(start_dt: datetime | None, when_text: str) -> bool:
+    """
+    True if start_dt is within the next WINDOW_MINUTES.
+    If start_dt is None, allow obvious "starting soon"/relative text as fallback.
+    """
+    if start_dt:
+        start = now_local()
+        end = start + timedelta(minutes=WINDOW_MINUTES)
+        return start <= start_dt <= end
+
+    # fallback if parsing failed
+    t = (when_text or "").lower()
+    if "starting soon" in t:
+        return True
+    if re.search(r"\bin\s+\d+\s+minutes?\b", t):
+        return True
+    if re.search(r"\bin\s+1\s+hour\b", t):
+        return True
+    return False
 
 
-def build_rss(items: list[EventItem]) -> str:
+def build_rss(items):
     last_build = rfc2822(datetime.now(timezone.utc))
 
     rss_items = []
     for it in items:
-        title = esc(it.title)
-        link = esc(it.link)
-        when_text = esc(it.when_text)
-        attendees_text = ""
-        if it.attendees is not None:
-            attendees_text = f"<p><b>Attendees:</b> {it.attendees}</p>"
+        title = esc(it.get("title", ""))
+        link = esc(it.get("url", ""))
+        when_text = esc(it.get("when_text", ""))
+        attendees = it.get("attendees")
 
-        when_block = f"<p><b>Time:</b> {when_text}</p>" if when_text else ""
-        desc = f"<![CDATA[{when_block}{attendees_text}<p><a href=\"{link}\">Open event</a></p>]]>"
+        desc_parts = []
+        if when_text:
+            desc_parts.append(f"<p><b>Time:</b> {when_text}</p>")
+        if attendees is not None:
+            desc_parts.append(f"<p><b>Attendees:</b> {attendees}</p>")
+        desc_parts.append(f"<p><a href=\"{link}\">Open event</a></p>")
+
+        desc = "<![CDATA[" + "".join(desc_parts) + "]]>"
 
         pubdate = ""
-        if it.start_dt:
-            pubdate = f"<pubDate>{rfc2822(it.start_dt.astimezone(timezone.utc))}</pubDate>"
+        if it.get("start_dt_utc"):
+            pubdate = f"<pubDate>{it['start_dt_utc']}</pubDate>"
 
-        rss_items.append(
-            f"""<item>
+        rss_items.append(f"""<item>
   <title>{title}</title>
   <link>{link}</link>
   <guid isPermaLink="true">{link}</guid>
   {pubdate}
   <description>{desc}</description>
-</item>"""
-        )
+</item>""")
 
     body = "\n".join(rss_items)
 
@@ -153,149 +182,134 @@ def build_rss(items: list[EventItem]) -> str:
   <link>{esc(FEED_LINK)}</link>
   <description>{esc(FEED_DESCRIPTION)}</description>
   <lastBuildDate>{last_build}</lastBuildDate>
-  <ttl>15</ttl>
+  <ttl>60</ttl>
 {body}
 </channel>
 </rss>
 """
 
 
-def normalize_link(href: str) -> str:
-    if not href:
-        return ""
-    href = href.strip()
-    if href.startswith("/"):
-        return "https://www.meetup.com" + href
-    return href
-
-
-def scrape_events() -> list[EventItem]:
+def scrape_meetup_cards():
     """
-    Render the page (lazy-loaded) and extract event cards best-effort.
-    Meetup DOM changes often, so we:
-      - locate anchors linking to /events/
-      - get nearest container text for time/attendees
-      - also try <time datetime="..."> when available
+    Render the lazy page and extract event-like cards using evaluate(),
+    similar to your previous scraper. Much more stable than brittle selectors.
     """
-    found: list[EventItem] = []
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            viewport={"width": 1280, "height": 2000},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            ),
-        )
+        page = browser.new_page(viewport={"width": 1400, "height": 2200})
 
         page.goto(MEETUP_URL, wait_until="domcontentloaded", timeout=120000)
-
-        # Let JS render initial cards
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(4000)
 
         # Scroll to trigger lazy-load
-        for _ in range(10):
-            page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(1100)
+        prev_height = 0
+        stable = 0
+        for _ in range(18):
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1200)
+            h = page.evaluate("document.body.scrollHeight")
+            if h == prev_height:
+                stable += 1
+            else:
+                stable = 0
+                prev_height = h
+            if stable >= 4:
+                break
 
-        # Primary: anchors that look like event links
-        anchors = page.locator("a[href*='/events/']")
-        total = min(anchors.count(), 120)
+        raw = page.evaluate(
+            """
+            () => {
+              const anchors = Array.from(document.querySelectorAll("a[href*='/events/']"));
+              const out = [];
+              const seen = new Set();
 
-        seen_links = set()
+              function absUrl(href) {
+                try { return new URL(href, location.origin).toString(); }
+                catch(e) { return href || ""; }
+              }
 
-        for i in range(total):
-            a = anchors.nth(i)
-            href = normalize_link(a.get_attribute("href") or "")
-            if not href or href in seen_links:
-                continue
+              for (const a of anchors) {
+                const url = absUrl(a.getAttribute("href") || a.href || "");
+                if (!url || seen.has(url)) continue;
+                seen.add(url);
 
-            # Container around the anchor (event card region)
-            container = a.locator("xpath=ancestor::*[self::article or self::li or self::div][1]")
+                // Try to find a card-like container near the link
+                const card = a.closest("article") || a.closest("li") || a.closest("div");
 
-            # Title: try aria-label, then inner text line 1
-            title = (a.get_attribute("aria-label") or "").strip()
-            if not title:
-                try:
-                    title = (a.inner_text() or "").strip().split("\n")[0].strip()
-                except Exception:
-                    title = ""
+                // Title: prefer h3 within card, else aria-label, else link text
+                let title =
+                  (card && card.querySelector("h3") && card.querySelector("h3").innerText) ||
+                  a.getAttribute("aria-label") ||
+                  a.innerText ||
+                  "";
 
-            if not title or len(title) < 3:
-                continue
+                title = (title || "").trim();
+                if (!title || title.length < 3) continue;
 
-            container_text = ""
-            try:
-                container_text = (container.inner_text() or "").strip()
-            except Exception:
-                container_text = title
+                // Time: prefer <time>, use datetime attr too if exists
+                const timeEl = card ? card.querySelector("time") : null;
+                const whenText = (timeEl && timeEl.innerText ? timeEl.innerText : "").trim();
+                const dtAttr = (timeEl && timeEl.getAttribute("datetime") ? timeEl.getAttribute("datetime") : "").trim();
 
-            # Try to get a precise datetime from a <time> element inside the container
-            start_dt = None
-            when_text = ""
-
-            try:
-                time_el = container.locator("time").first
-                if time_el.count() > 0:
-                    dt_attr = (time_el.get_attribute("datetime") or "").strip()
-                    when_text = (time_el.inner_text() or "").strip()
-                    if dt_attr:
-                        try:
-                            parsed = dateparser.parse(dt_attr)
-                            if parsed:
-                                if parsed.tzinfo is None:
-                                    parsed = parsed.replace(tzinfo=LOCAL_TZ)
-                                else:
-                                    parsed = parsed.astimezone(LOCAL_TZ)
-                                start_dt = parsed
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            # If no <time datetime>, heuristically pick a line that looks like time/day
-            if start_dt is None:
-                lines = [ln.strip() for ln in container_text.split("\n") if ln.strip()]
-                # Look for any line that includes AM/PM or weekday
-                for ln in lines[:15]:
-                    if re.search(r"\b(AM|PM)\b", ln) or re.search(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", ln, re.I):
-                        when_text = ln
-                        break
-                start_dt = parse_start_datetime(when_text)
-
-            attendees = parse_attendees(container_text)
-
-            seen_links.add(href)
-
-            found.append(
-                EventItem(
-                    title=title,
-                    link=href,
-                    when_text=when_text,
-                    start_dt=start_dt,
-                    attendees=attendees,
-                )
-            )
+                // Grab card text for attendee parsing
+                const cardText = (card && card.innerText) ? card.innerText : (a.innerText || "");
+                out.push({
+                  title,
+                  url,
+                  whenText,
+                  dtAttr,
+                  cardText
+                });
+              }
+              return out;
+            }
+            """
+        )
 
         browser.close()
-
-    # Filter to next hour
-    upcoming = [e for e in found if within_next_hour(e.start_dt)]
-
-    # Sort by start time
-    upcoming.sort(key=lambda x: x.start_dt or datetime.max.replace(tzinfo=LOCAL_TZ))
-
-    return upcoming[:MAX_ITEMS]
+        return raw
 
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    try:
-        items = scrape_events()
-    except PlaywrightTimeoutError:
-        items = []
+    raw = scrape_meetup_cards()
+
+    # Convert + filter
+    items = []
+    for r in raw:
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        when_text = (r.get("whenText") or "").strip()
+        dt_attr = (r.get("dtAttr") or "").strip()
+        card_text = r.get("cardText") or ""
+
+        attendees = extract_attendees_from_text(card_text)
+
+        start_dt = parse_start_dt(dt_attr, when_text)
+        keep = is_within_next_hour(start_dt, when_text)
+        if not keep:
+            continue
+
+        start_dt_utc = None
+        if start_dt:
+            start_dt_utc = rfc2822(start_dt.astimezone(timezone.utc))
+
+        items.append({
+            "title": title,
+            "url": url,
+            "when_text": when_text,
+            "attendees": attendees,
+            "start_dt": start_dt,
+            "start_dt_utc": start_dt_utc,
+        })
+
+    # Sort by start_dt (unknown times last)
+    far = datetime.max.replace(tzinfo=LOCAL_TZ)
+    items.sort(key=lambda x: x["start_dt"] if x["start_dt"] else far)
+
+    # Cap
+    items = items[:MAX_ITEMS]
 
     rss = build_rss(items)
 
@@ -303,6 +317,9 @@ def main():
         f.write(rss)
 
     print(f"Wrote {OUT_FILE} with {len(items)} items (next {WINDOW_MINUTES} minutes).")
+    # Helpful debug in Actions logs:
+    for it in items[:10]:
+        print("DEBUG:", it["title"], "|", it["when_text"], "| attendees:", it["attendees"], "| start_dt:", it["start_dt"])
 
 
 if __name__ == "__main__":
