@@ -18,7 +18,7 @@ DEBUG_PNG = os.path.join(OUT_DIR, "debug.png")
 DEBUG_JSON = os.path.join(OUT_DIR, "debug.json")
 
 LOCAL_TZ = ZoneInfo("America/Toronto")
-WINDOW_MINUTES = 60
+WINDOW_MINUTES = 90
 MAX_ITEMS = 50
 
 FEED_TITLE = "Meetup (Online) — Starting Soon (Next Hour)"
