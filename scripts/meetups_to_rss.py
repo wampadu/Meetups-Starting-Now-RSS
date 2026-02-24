@@ -332,6 +332,6 @@ def main():
     print(f"Wrote {OUT_FILE} with {len(items)} items (next {WINDOW_MINUTES} minutes).")
     # Helpful debug in Actions logs:
     for it in items[:10]:
-        print("EVENT:", it["title"], "|", it["when_text"], "| attendees:", it["attendees"], "| start_dt:", it["start_dt"])\n
+        print("EVENT:", it["title"], "|", it["when_text"], "| attendees:", it["attendees"], "| start_dt:", it["start_dt"])
 if __name__ == "__main__":
     main()
