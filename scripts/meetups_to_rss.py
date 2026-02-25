@@ -40,7 +40,7 @@ LOCAL_TZ = ZoneInfo("America/Toronto")
 WINDOW_MINUTES = 90
 MAX_ITEMS = 50
 
-FEED_TITLE = "Meetup (Online) — Starting Soon (Most Attendees First)"
+FEED_TITLE = "Meetup — Starting Within an Hour"
 FEED_LINK = MEETUP_URL
 FEED_DESCRIPTION = (
     "Auto-generated RSS for Meetup online events starting soon. "
